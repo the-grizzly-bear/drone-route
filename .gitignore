@@ -1,0 +1,9 @@
+.gradle/
+build/
+local.properties
+core-rs/target/
+*.apk
+keychains.json
+maps/
+*.apk
+__pycache__/

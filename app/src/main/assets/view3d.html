@@ -1,0 +1,316 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Drone Route 3D</title>
+<script src="/assets/polyfills.js">
+</script>
+<script>window.CESIUM_BASE_URL = '/assets/cesium/';
+</script>
+<script src="/assets/cesium/Cesium.js">
+</script>
+<link href="/assets/cesium/Widgets/widgets.css" rel="stylesheet">
+<style>
+  html, body, #v { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #15181c; font-family: sans-serif; }
+  #hud { position: absolute; left: 8px; top: 8px; right: 8px; color: #fff; background: rgba(21,24,28,.82);
+         padding: 6px 10px; border-radius: 6px; font: 13px/1.35 monospace; pointer-events: none; white-space: pre; overflow: hidden; }
+  #bar { position: absolute; right: 8px; bottom: 70px; display: flex; flex-direction: column; gap: 6px; }
+  #bar button { background: rgba(21,24,28,.85); color: #fff; border: 1px solid #555; border-radius: 6px;
+                padding: 9px 12px; font-size: 14px; min-width: 76px; }
+  #bar button.on { background: #ff8a00; color: #000; border-color: #ff8a00; }
+  #legend { position: absolute; right: 132px; bottom: 74px; color: #fff; background: rgba(21,24,28,.82); padding: 6px 10px;
+            border-radius: 6px; font: 12px sans-serif; display: none; }
+  #legend .ramp { width: 160px; height: 10px; border-radius: 3px; margin: 4px 0 2px; }
+  #legend .ends { display: flex; justify-content: space-between; }
+  #err { position: absolute; left: 8px; bottom: 70px; color: #ffb020; font: 12px sans-serif; max-width: 60%; }
+  .cesium-viewer-bottom { display: none; }
+</style>
+</head>
+<body>
+<div id="v"></div>
+<div id="hud">Loading…</div>
+<div id="err"></div>
+<div id="legend"><div id="lgTitle"></div><div class="ramp" id="lgRamp"></div><div class="ends"><span id="lgLo"></span><span id="lgHi"></span></div></div>
+<div id="bar">
+  <button id="bBack" onclick="location.href='droneroute://back'">‹ Back</button>
+  <button id="bFollow">Follow</button>
+  <button id="bTilt">Top</button>
+  <button id="bFit">Fit</button>
+  <button id="bTrack">Track</button>
+  <button id="bWall" class="on">Curtain</button>
+  <button id="bColor">Color: Track</button>
+</div>
+<script>(async () => {
+  const $ = id => document.getElementById(id);
+  const err = m => { $('err').textContent += m + '\n'; };
+  Cesium.Ion.defaultAccessToken = '';
+
+  const cfg = await (await fetch('/data/config.json')).json();
+  const tracks = await (await fetch('/data/tracks.json')).json();
+
+  const N = 65;
+  const DEM_MAX = cfg.demMaxZoom;
+  const cache = new Map();
+  let fallbackGround = 0;
+  async function demTile(z, x, y) {
+    const k = z + '/' + x + '/' + y;
+    if (cache.has(k)) return cache.get(k);
+    const p = (async () => {
+      const r = await fetch('/tiles/dem/' + k);
+      if (!r.ok) return null;
+      const bmp = await createImageBitmap(await r.blob());
+      const c = new OffscreenCanvas(256, 256), g = c.getContext('2d', { willReadFrequently: true });
+      g.drawImage(bmp, 0, 0);
+      const d = g.getImageData(0, 0, 256, 256).data;
+      const h = new Float32Array(256 * 256);
+      for (let i = 0; i < h.length; i++) h[i] = d[i * 4] * 256 + d[i * 4 + 1] + d[i * 4 + 2] / 256 - 32768;
+      return h;
+    })().catch(() => null);
+    cache.set(k, p);
+    if (cache.size > 300) cache.delete(cache.keys().next().value);
+    return p;
+  }
+  const terrainProvider = new Cesium.CustomHeightmapTerrainProvider({
+    width: N, height: N,
+    tilingScheme: new Cesium.WebMercatorTilingScheme(),
+    callback: async (x, y, level) => {
+
+      const d = Math.max(0, level - DEM_MAX);
+      const z = level - d, s = 1 << d, n = 1 << z;
+      const w = 256 / s, gx0 = x * w, gy0 = y * w;
+      const tx0 = Math.floor((gx0 - 1) / 256), tx1 = Math.floor((gx0 + w + 1) / 256);
+      const ty0 = Math.floor((gy0 - 1) / 256), ty1 = Math.floor((gy0 + w + 1) / 256);
+      const tiles = new Map();
+      const jobs = [];
+      for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) {
+        if (ty < 0 || ty >= n) continue;
+        const wx = ((tx % n) + n) % n;
+        jobs.push(demTile(z, wx, ty).then(h => tiles.set(tx + ',' + ty, h)));
+      }
+      await Promise.all(jobs);
+      const home = tiles.get(Math.floor((gx0 + w / 2) / 256) + ',' + Math.floor((gy0 + w / 2) / 256));
+      const out = new Float32Array(N * N);
+      if (!home) { out.fill(fallbackGround); return out; }
+      const maxG = n * 256 - 1;
+      const px = (gx, gy) => {
+        gx = Math.min(maxG, Math.max(0, gx)); gy = Math.min(maxG, Math.max(0, gy));
+        const t = tiles.get(Math.floor(gx / 256) + ',' + Math.floor(gy / 256)) || home;
+        return t[(gy & 255) * 256 + (gx & 255)];
+      };
+      for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+
+        const fx = gx0 + i * w / (N - 1) - 0.5, fy = gy0 + j * w / (N - 1) - 0.5;
+        const x0 = Math.floor(fx), y0 = Math.floor(fy), ax = fx - x0, ay = fy - y0;
+        out[j * N + i] = (px(x0, y0) * (1 - ax) + px(x0 + 1, y0) * ax) * (1 - ay)
+                       + (px(x0, y0 + 1) * (1 - ax) + px(x0 + 1, y0 + 1) * ax) * ay;
+      }
+      return out;
+    },
+  });
+
+  const imagery = new Cesium.UrlTemplateImageryProvider({
+    url: '/tiles/img/{z}/{x}/{y}', maximumLevel: cfg.imgMaxZoom, credit: cfg.imgCredit,
+  });
+  const viewer = new Cesium.Viewer('v', {
+    baseLayer: new Cesium.ImageryLayer(imagery),
+    terrainProvider,
+    baseLayerPicker: false, geocoder: false, homeButton: false, sceneModePicker: false,
+    navigationHelpButton: false, fullscreenButton: false, infoBox: false, selectionIndicator: false,
+    animation: true, timeline: true, shouldAnimate: false,
+  });
+  const scene = viewer.scene; window.viewer = viewer;
+  scene.globe.depthTestAgainstTerrain = true;
+  scene.globe.maximumScreenSpaceError = 3;
+  scene.globe.tileCacheSize = 300;
+
+  viewer.animation.viewModel.setShuttleRingTicks([0.5, 1, 2, 5, 10, 20, 30, 60]);
+  viewer.clock.multiplier = 10;
+  viewer.clock.onTick.addEventListener(c => {
+    if (Math.abs(c.multiplier) > 60) c.multiplier = Math.sign(c.multiplier) * 60;
+  });
+
+  const J = ms => Cesium.JulianDate.fromDate(new Date(ms));
+
+  async function groundAt(lat, lon) {
+    const z = DEM_MAX, n = 1 << z;
+    const fx = (lon + 180) / 360 * n * 256;
+    const fy = (1 - Math.asinh(Math.tan(lat * Math.PI / 180)) / Math.PI) / 2 * n * 256;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const t = await demTile(z, Math.floor(fx / 256), Math.floor(fy / 256));
+      if (t) return t[(Math.floor(fy) & 255) * 256 + (Math.floor(fx) & 255)];
+      cache.delete(z + '/' + Math.floor(fx / 256) + '/' + Math.floor(fy / 256));
+      await new Promise(r => setTimeout(r, 1200));
+    }
+    return null;
+  }
+
+  const built = [];
+  for (const t of tracks) {
+    const P = t.pts;
+
+    let base = null;
+    if (t.home) base = await groundAt(t.home[0], t.home[1]).catch(() => null);
+    if (base == null && P[0][3] != null && Math.abs(P[0][3]) < 15) base = await groundAt(P[0][1], P[0][2]).catch(() => null);
+    if (base == null) {
+      const diffs = P.filter(p => p[3] != null && p[4] != null && p[4] > 100).map(p => p[4] - p[3]).sort((a, b) => a - b);
+      if (diffs.length) base = diffs[diffs.length >> 1];
+    }
+    if (base == null) { const g = await groundAt(P[0][1], P[0][2]).catch(() => null); base = g != null ? g - (P[0][3] || 0) : 0; }
+    if (!fallbackGround) fallbackGround = base;
+    const alt = p => p[3] != null ? base + p[3] : (p[4] != null ? p[4] : base);
+    const pos = P.map(p => Cesium.Cartesian3.fromDegrees(p[2], p[1], alt(p)));
+    const col = Cesium.Color.fromCssColorString(t.color);
+
+    const line = viewer.entities.add({ polyline: { positions: pos, width: 3, material: col } });
+    const wall = viewer.entities.add({ wall: { positions: pos, material: col.withAlpha(0.22), outline: false } });
+    for (const p of P.filter(p => p[7]).slice(0, 400))
+      viewer.entities.add({ position: Cesium.Cartesian3.fromDegrees(p[2], p[1], alt(p)),
+        point: { pixelSize: 7, color: Cesium.Color.WHITE, outlineColor: col, outlineWidth: 2 } });
+    if (t.home) viewer.entities.add({ position: Cesium.Cartesian3.fromDegrees(t.home[1], t.home[0]),
+        point: { pixelSize: 14, color: col, outlineColor: Cesium.Color.WHITE, outlineWidth: 2,
+                 heightReference: Cesium.HeightReference.CLAMP_TO_GROUND, disableDepthTestDistance: Number.POSITIVE_INFINITY },
+        label: { text: 'H', font: 'bold 13px sans-serif', fillColor: Cesium.Color.BLACK,
+                 heightReference: Cesium.HeightReference.CLAMP_TO_GROUND, disableDepthTestDistance: Number.POSITIVE_INFINITY } });
+
+    const sp = new Cesium.SampledPositionProperty();
+    P.forEach((p, i) => sp.addSample(J(p[0]), pos[i]));
+    built.push({ t, P, pos, line, wall, sp, alt, col, prim: null, start: J(P[0][0]), stop: J(P[P.length - 1][0]) });
+  }
+
+  const drone = viewer.entities.add({
+    viewFrom: new Cesium.Cartesian3(-120, -260, 160),
+    position: new Cesium.CallbackProperty(() => cur && cur.sp.getValue(viewer.clock.currentTime), false),
+    point: { pixelSize: 13, color: Cesium.Color.WHITE, outlineColor: Cesium.Color.BLACK, outlineWidth: 3,
+             disableDepthTestDistance: Number.POSITIVE_INFINITY },
+
+    polyline: { positions: new Cesium.CallbackProperty(() => {
+      if (!cur) return [];
+      const c = cur.sp.getValue(viewer.clock.currentTime); if (!c) return [];
+      const g = Cesium.Cartographic.fromCartesian(c);
+      const h = scene.globe.getHeight(g) ?? 0;
+      return [c, Cesium.Cartesian3.fromRadians(g.longitude, g.latitude, h)];
+    }, false), width: 1.5, material: Cesium.Color.WHITE.withAlpha(0.8) },
+  });
+
+  let cur = null, curIdx = 0;
+  function setActive(i) {
+    curIdx = i; cur = built[i];
+    built.forEach((b, k) => { b.line.polyline.width = k === i ? 4 : 2; });
+    const clk = viewer.clock;
+    clk.startTime = cur.start.clone(); clk.stopTime = cur.stop.clone(); clk.currentTime = cur.start.clone();
+    clk.clockRange = Cesium.ClockRange.CLAMPED;
+    viewer.timeline.zoomTo(cur.start, cur.stop);
+  }
+
+  const fmt = s => { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+  function nearestIdx(time) {
+    const ms = Cesium.JulianDate.toDate(time).getTime(); const P = cur.P;
+    let lo = 0, hi = P.length - 1;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (P[m][0] < ms) lo = m + 1; else hi = m; }
+    return lo;
+  }
+  viewer.clock.onTick.addEventListener(clk => {
+    if (!cur) return;
+    const p = cur.P[nearestIdx(clk.currentTime)];
+    const d = new Date(p[0]);
+    let s = (tracks.length > 1 ? `[${curIdx + 1}/${tracks.length}] ` : '') + cur.t.name + '\n' +
+      d.toTimeString().slice(0, 8) + '  +' + fmt((p[0] - cur.P[0][0]) / 1000);
+    if (p[3] != null) s += `   H ${p[3].toFixed(0)} m`;
+    s += `   MSL ${cur.alt(p).toFixed(0)} m`;
+    if (p[8] != null) s += `   ${p[8].toFixed(1)} m/s`;
+    if (p[9]) s += `   bat ${p[9]}%`;
+    if (p[6] != null) s += `   gimbal ${p[6].toFixed(0)}°`;
+    s += `\n${p[1].toFixed(6)}, ${p[2].toFixed(6)}`;
+    $('hud').textContent = s;
+  });
+
+  function fit(tilted = true) {
+    const all = cur ? cur.pos : built.flatMap(b => b.pos);
+    const bs = Cesium.BoundingSphere.fromPoints(all);
+    viewer.camera.flyToBoundingSphere(bs, { duration: 1.2,
+      offset: new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(tilted ? -35 : -89.9), Math.max(bs.radius * 3.2, 400)) });
+  }
+  let top = false;
+  $('bFit').onclick = () => { viewer.trackedEntity = undefined; $('bFollow').classList.remove('on'); fit(!top); };
+  $('bTilt').onclick = () => { top = !top; $('bTilt').textContent = top ? 'Tilt' : 'Top'; fit(!top); };
+  $('bFollow').onclick = () => {
+    const on = viewer.trackedEntity !== drone;
+    viewer.trackedEntity = on ? drone : undefined;
+    $('bFollow').classList.toggle('on', on);
+    if (on) viewer.clock.shouldAnimate = true;
+  };
+
+  const MODES = ['Track', 'Speed', 'Altitude'];
+  let mode = 0;
+  const allSpd = built.flatMap(b => b.P.map(p => p[8]).filter(v => v != null)).sort((a, b) => a - b);
+    const q = (arr, f) => arr.length ? arr[Math.min(arr.length - 1, Math.floor(f * arr.length))] : 0;
+  const spdMax = Math.max(1, q(allSpd, 0.95));
+  const allAlt = built.flatMap(b => b.P.map(p => b.alt(p)));
+  const altMin = Math.min(...allAlt), altMax = Math.max(altMin + 1, Math.max(...allAlt));
+  const clamp01 = v => Math.max(0, Math.min(1, v));
+  function vertexColor(b, p) {
+    if (MODES[mode] === 'Speed') {
+      const f = clamp01((p[8] ?? 0) / spdMax);
+      const hsl = b.col.toBytes();
+      const c = Cesium.Color.fromBytes(hsl[0], hsl[1], hsl[2]);
+      const [h, sat] = rgbToHsl(c.red, c.green, c.blue);
+      return Cesium.Color.fromHsl(h, Math.max(sat, 0.7), 0.22 + 0.63 * f, 1);
+    }
+
+    const n = clamp01((b.alt(p) - altMin) / (altMax - altMin));
+    return new Cesium.Color(n, 0, 1 - n, 1);
+  }
+  function rgbToHsl(r, g, b) {
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2;
+    if (mx === mn) return [0, 0, l];
+    const d = mx - mn, s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+    const h = mx === r ? ((g - b) / d + (g < b ? 6 : 0)) : mx === g ? ((b - r) / d + 2) : ((r - g) / d + 4);
+    return [h / 6, s, l];
+  }
+  function applyColors() {
+    built.forEach((b, k) => {
+      if (b.prim) { scene.primitives.remove(b.prim); b.prim = null; }
+      const plain = MODES[mode] === 'Track';
+      b.line.show = plain;
+      if (!plain && b.pos.length > 1) {
+        b.prim = scene.primitives.add(new Cesium.Primitive({
+          geometryInstances: new Cesium.GeometryInstance({ geometry: new Cesium.PolylineGeometry({
+            positions: b.pos, width: k === curIdx ? 5 : 3, colors: b.P.map(p => vertexColor(b, p)), colorsPerVertex: true }) }),
+          appearance: new Cesium.PolylineColorAppearance({ translucent: false }),
+        }));
+      }
+    });
+    $('bColor').textContent = 'Color: ' + MODES[mode];
+    const lg = $('legend');
+    if (MODES[mode] === 'Track') { lg.style.display = 'none'; return; }
+    lg.style.display = 'block';
+    if (MODES[mode] === 'Speed') {
+      const c = built[curIdx].col.toCssColorString();
+      $('lgTitle').textContent = 'Speed (dark = slow, light = fast)';
+      $('lgRamp').style.background = `linear-gradient(90deg, #111, ${c}, #fff)`;
+      $('lgLo').textContent = '0 m/s'; $('lgHi').textContent = spdMax.toFixed(0) + '+ m/s';
+    } else {
+      $('lgTitle').textContent = 'Altitude (MSL)';
+      $('lgRamp').style.background = 'linear-gradient(90deg, rgb(0,0,255), rgb(255,0,0))';
+      $('lgLo').textContent = altMin.toFixed(0) + ' m'; $('lgHi').textContent = altMax.toFixed(0) + ' m';
+    }
+  }
+  $('bColor').onclick = () => { mode = (mode + 1) % MODES.length; applyColors(); };
+  window.applyColors = applyColors; window.setColorMode = m => { mode = MODES.indexOf(m); applyColors(); };
+
+  $('bWall').onclick = () => {
+    const on = !$('bWall').classList.contains('on');
+    $('bWall').classList.toggle('on', on); built.forEach(b => b.wall.show = on);
+  };
+  $('bTrack').onclick = () => { if (built.length > 1) { setActive((curIdx + 1) % built.length); applyColors(); fit(!top); } };
+  if (built.length < 2) $('bTrack').style.display = 'none';
+
+  if (!built.length) { $('hud').textContent = 'No tracks'; return; }
+  setActive(0);
+  fit(true);
+  if (cfg.demSource === 'none') err('No terrain data: route shown over flat ground.');
+})().catch(e => { document.getElementById('hud').textContent = 'Error: ' + (e && e.stack || e); });
+</script>
+</body>
+</html>
