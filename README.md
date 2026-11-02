@@ -32,3 +32,11 @@ Map DJI drone flights on the controller and send the tracks to CalTopo. No expor
 - Terrain pack for offline 3D: `python3 tools/make_terrain_mbtiles.py OUT.mbtiles S W N E 12`
 
 Uses dji-log-parser (MIT), CesiumJS (Apache-2.0), osmdroid (Apache-2.0), DJI Mobile SDK.
+
+## License
+Free for search and rescue, public safety and other noncommercial use.
+Please don't redistribute or modify it outside of contributing back here.
+Issues, feature requests and pull requests welcome. Making changes to submit
+a pull request is fine; by submitting one, you agree it can be included and
+licensed under the same terms.
+PolyForm Strict 1.0.0, see LICENSE.
